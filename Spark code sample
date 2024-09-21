@@ -1,0 +1,79 @@
+%spark
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+
+val spark = SparkSession.builder()
+  .appName("Spark Cassandra")
+  .config("spark.cassandra.connection.host", "0.0.0.0")
+  .config("spark.cassandra.connection.port", "9042")
+  .getOrCreate()
+
+val df1 = spark
+  .readStream
+  .format("kafka")
+  .option("kafka.bootstrap.servers", "localhost:9092")
+  .option("subscribe", "userVisited")
+  .load()
+
+val kafkaData = df1
+  .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
+  .withColumn("value", regexp_replace(col("value"), "\"", ""))
+  .withColumn("value", split(col("value"), ","))
+  .select(
+    col("value").getItem(0).as("customer_email"),
+    col("value").getItem(1).as("product_id")
+  )
+  .withColumn("product_id", col("product_id").cast("int"))
+  .withColumn("discount", lit(0))
+  .withColumn("visit_count", lit(1))
+
+val df = spark.read
+  .format("org.apache.spark.sql.cassandra")
+  .options(Map("table" -> "customer_visits", "keyspace" -> "customervists"))
+  .load()
+
+val dfWithLongId = df.withColumn("id", col("id").cast("long"))
+
+val maxIdRow = dfWithLongId.agg(max("id").as("max_id")).collect()(0)
+val maxId = if (maxIdRow.isNullAt(0)) 0L else maxIdRow.getAs[Long]("max_id")
+
+val newDf = kafkaData
+  .withColumn("id", expr(s"$maxId + monotonically_increasing_id() + 1"))
+
+newDf.createOrReplaceTempView("new_data")
+dfWithLongId.createOrReplaceTempView("existing_data")
+
+val updatedData = spark.sql("""
+  SELECT
+    COALESCE(e.id, n.id) AS id,
+    COALESCE(e.customer_email, n.customer_email) AS customer_email,
+    COALESCE(n.product_id, e.product_id) AS product_id,
+    COALESCE(e.visit_count, 0) + COALESCE(n.visit_count, 1) AS visit_count,
+    COALESCE(e.discount, 0) AS discount
+  FROM
+    new_data n
+  FULL OUTER JOIN
+    existing_data e
+  ON
+    e.customer_email = n.customer_email
+""")
+
+val updatedWithDiscount = updatedData.withColumn("discount",
+  when(col("visit_count") > 46, 60)
+    .otherwise(
+      (5 + (floor((col("visit_count") - 1) / 4) * 5)).cast("int")
+    )
+)
+
+updatedWithDiscount.write
+  .format("org.apache.spark.sql.cassandra")
+  .options(Map("table" -> "customer_visits", "keyspace" -> "customervists"))
+  .mode("append")
+  .save()
+
+val query = kafkaData.writeStream
+  .outputMode("append")
+  .format("console")
+  .start()
+
+query.awaitTermination()
